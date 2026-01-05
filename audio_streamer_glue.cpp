@@ -5,26 +5,29 @@
 #include <switch_json.h>
 #include <fstream>
 #include <switch_buffer.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <atomic>
-#include <vector>
 #include <memory>
+#include <thread>
+#include <vector>
 #include <mutex>
 #include "base64.h"
 
-#define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+#define FRAME_SIZE_8000 320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 
-class AudioStreamer {
+class AudioStreamer
+{
 public:
-    // Factory
+    // Factory (upstream RAII pattern with shared_ptr/weak_ptr)
     static std::shared_ptr<AudioStreamer> create(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
-        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
+        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile,
         const char* tls_certfile, bool tls_disable_hostname_validation) {
 
         std::shared_ptr<AudioStreamer> sp(new AudioStreamer(
             uuid, wsUri, callback, deflate, heart_beat,
-            suppressLog, extra_headers, tls_cafile, tls_keyfile, 
+            suppressLog, extra_headers, tls_cafile, tls_keyfile,
             tls_certfile, tls_disable_hostname_validation
         ));
 
@@ -90,9 +93,9 @@ private:
     // Ctor
     AudioStreamer(
         const char* uuid, const char* wsUri, responseHandler_t callback, int deflate, int heart_beat,
-        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile, 
+        bool suppressLog, const char* extra_headers, const char* tls_cafile, const char* tls_keyfile,
         const char* tls_certfile, bool tls_disable_hostname_validation
-    ) : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), 
+    ) : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog),
         m_extra_headers(extra_headers), m_playFile(0) {
 
         WebSocketHeaders hdrs;
@@ -148,7 +151,10 @@ private:
 
     struct ProcessResult {
         switch_bool_t ok = SWITCH_FALSE;
+        bool isRawAudio = false;
         std::string rewrittenJsonData;
+        std::string rawAudioDecoded;
+        int sampleRate = 0;
         std::vector<std::string> errors;
     };
 
@@ -253,12 +259,12 @@ private:
     void eventCallback(notifyEvent_t event, const char* message) {
         std::string msg = message ? message : "";
 
-        // processing without holding a session
+        // processing without holding a session (for file-based audio types)
         ProcessResult pr;
         if (event == MESSAGE) {
             pr = processMessage(msg);
-            if (pr.ok == SWITCH_TRUE) {
-                msg = pr.rewrittenJsonData; // overwrite only on success
+            if (pr.ok == SWITCH_TRUE && !pr.isRawAudio) {
+                msg = pr.rewrittenJsonData; // overwrite only on success (file-based)
             }
         }
 
@@ -290,7 +296,14 @@ private:
 
             case MESSAGE:
                 if (pr.ok == SWITCH_TRUE) {
-                    m_notify(psession, EVENT_PLAY, msg.c_str());
+                    if (pr.isRawAudio) {
+                        // Bidirectional: write raw audio to write_sbuffer for playback
+                        writeRawToWriteBuffer(psession, pr);
+                        // Still notify as EVENT_JSON (no file to report)
+                        m_notify(psession, EVENT_JSON, msg.c_str());
+                    } else {
+                        m_notify(psession, EVENT_PLAY, msg.c_str());
+                    }
                 } else {
                     // fall back to EVENT_JSON
                     m_notify(psession, EVENT_JSON, msg.c_str());
@@ -306,6 +319,67 @@ private:
         switch_core_session_rwunlock(psession);
     }
 
+    // Write raw audio into the write_sbuffer for bidirectional playback via write_frame_thread
+    void writeRawToWriteBuffer(switch_core_session_t *session, const ProcessResult& pr) {
+        auto *bug = get_media_bug(session);
+        if (!bug) return;
+
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || tech_pvt->close_requested) return;
+
+        const int inRate = tech_pvt->wsSampling;
+        const int outRate = tech_pvt->sampling;
+        const int channels = tech_pvt->channels;
+
+        spx_uint32_t in_frames = pr.rawAudioDecoded.size() / (sizeof(spx_int16_t) * channels);
+        spx_uint32_t max_out = (spx_uint32_t)((double)in_frames * outRate / inRate) + 1;
+
+        std::vector<spx_int16_t> in_buf(in_frames * channels);
+        std::vector<spx_int16_t> out_buf(max_out * channels);
+        memcpy(in_buf.data(), pr.rawAudioDecoded.data(), pr.rawAudioDecoded.size());
+
+        spx_uint32_t in_len = in_frames;
+        spx_uint32_t out_len = max_out;
+
+        if (tech_pvt->sampling == tech_pvt->wsSampling) {
+            out_buf = in_buf;
+            out_len = in_len;
+        } else {
+            if (channels == 1) {
+                speex_resampler_process_int(tech_pvt->write_resampler, 0,
+                                            in_buf.data(), &in_len,
+                                            out_buf.data(), &out_len);
+            } else {
+                speex_resampler_process_interleaved_int(tech_pvt->write_resampler,
+                                                        in_buf.data(), &in_len,
+                                                        out_buf.data(), &out_len);
+            }
+        }
+
+        const size_t bytes_out = out_len * channels * sizeof(spx_int16_t);
+        if (switch_mutex_lock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
+            size_t remaining = bytes_out;
+            const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
+            while (remaining > 0) {
+                switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
+                if (free_space == 0) {
+                    switch_mutex_unlock(tech_pvt->write_mutex);
+                    switch_yield(10000);
+                    switch_mutex_lock(tech_pvt->write_mutex);
+                    continue;
+                }
+                size_t chunk = std::min<size_t>(remaining, free_space);
+                switch_buffer_write(tech_pvt->write_sbuffer, ptr, chunk);
+                ptr += chunk;
+                remaining -= chunk;
+            }
+            switch_mutex_unlock(tech_pvt->write_mutex);
+        } else {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "%s write mutex lock failed dropping all %zu bytes\n",
+                              tech_pvt->sessionId, bytes_out);
+        }
+    }
 
     ProcessResult processMessage(const std::string& message) {
         ProcessResult out;
@@ -343,29 +417,31 @@ private:
 
         // sampleRate (only meaningful for raw)
         int sampleRate = 0;
-        if (cJSON* jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate")) {
-            sampleRate = jsonSampleRate->valueint;
+        if (cJSON_IsNumber(cJSON_GetObjectItem(jsonData, "sampleRate"))) {
+            sampleRate = cJSON_GetObjectItem(jsonData, "sampleRate")->valueint;
         }
 
-        // map file type
-        std::string fileType;
+        // Raw audio: bidirectional streaming path - decode and pass to write buffer
         if (std::strcmp(jsAudioDataType, "raw") == 0) {
-            switch (sampleRate) {
-                case 8000:  fileType = ".r8";  break;
-                case 16000: fileType = ".r16"; break;
-                case 24000: fileType = ".r24"; break;
-                case 32000: fileType = ".r32"; break;
-                case 48000: fileType = ".r48"; break;
-                case 64000: fileType = ".r64"; break;
-                default:
-                    push_err(out, m_sessionId, "processMessage - unsupported sample rate: " + std::to_string(sampleRate));
-                    return out;
+            try {
+                out.rawAudioDecoded = base64_decode(jsonAudio->valuestring);
+            } catch (const std::exception& e) {
+                push_err(out, m_sessionId, "processMessage - base64 decode error: " + std::string(e.what()));
+                return out;
             }
-        } else if (std::strcmp(jsAudioDataType, "wav") == 0)  fileType = ".wav";
-        else if (std::strcmp(jsAudioDataType, "mp3") == 0)   fileType = ".mp3";
-        else if (std::strcmp(jsAudioDataType, "ogg") == 0)   fileType = ".ogg";
-        else if (std::strcmp(jsAudioDataType, "pcmu") == 0)  fileType = ".pcmu";
-        else if (std::strcmp(jsAudioDataType, "pcma") == 0)  fileType = ".pcma";
+            out.isRawAudio = true;
+            out.sampleRate = sampleRate;
+            out.ok = SWITCH_TRUE;
+            return out;
+        }
+
+        // File-based audio types
+        std::string fileType;
+        if (std::strcmp(jsAudioDataType, "wav") == 0)       fileType = ".wav";
+        else if (std::strcmp(jsAudioDataType, "mp3") == 0)  fileType = ".mp3";
+        else if (std::strcmp(jsAudioDataType, "ogg") == 0)  fileType = ".ogg";
+        else if (std::strcmp(jsAudioDataType, "pcmu") == 0) fileType = ".pcmu";
+        else if (std::strcmp(jsAudioDataType, "pcma") == 0) fileType = ".pcma";
         else {
             push_err(out, m_sessionId, "processMessage - unsupported audio type: " + std::string(jsAudioDataType));
             return out;
@@ -442,10 +518,95 @@ private:
 
 namespace {
 
+    // Voxcom: write_frame_thread for bidirectional streaming
+    void *SWITCH_THREAD_FUNC write_frame_thread(switch_thread_t *thread, void *obj)
+    {
+        switch_core_session_t *session = (switch_core_session_t *)obj;
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel)
+            return NULL;
+
+        auto *bug = (switch_media_bug_t *)switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "no media bug in write frame thread\n");
+            return NULL;
+        }
+
+        private_t *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "write_frame_thread: missing tech_pvt\n");
+            return NULL;
+        }
+
+        switch_timer_t timer = {0};
+        switch_frame_t write_frame = {0};
+        switch_codec_t write_codec = {0};
+        switch_codec_t *read_codec;
+
+        uint32_t sample_rate = tech_pvt->sampling;
+        uint32_t channels = tech_pvt->channels;
+
+        read_codec = switch_core_session_get_read_codec(session);
+        if (!read_codec || !read_codec->implementation)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "write_frame_thread: no read codec available, shutting down\n");
+            return NULL;
+        }
+
+        uint32_t interval = read_codec->implementation->microseconds_per_packet / 1000;
+        uint32_t samples = switch_samples_per_packet(sample_rate, interval);
+        uint32_t tsamples = read_codec->implementation->actual_samples_per_second;
+        uint32_t bytes = samples * 2 * channels;
+
+        if (switch_core_codec_init(&write_codec, "L16", NULL, NULL, sample_rate, interval, channels,
+                                   SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE, NULL,
+                                   switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                              "Codec Activated L16@%uhz %u channels %dms\n", sample_rate, channels, interval);
+        }
+        write_frame.codec = &write_codec;
+        write_frame.data = switch_core_session_alloc(session, SWITCH_RECOMMENDED_BUFFER_SIZE);
+        write_frame.channels = channels;
+        write_frame.rate = sample_rate;
+        write_frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "started write frame thread with sample rate [%u] interval [%u] samples [%u] tsamples [%u] bytes [%u]\n", sample_rate, interval, samples, tsamples, bytes);
+
+        if (switch_core_timer_init(&timer, "soft", interval, tsamples, NULL) != SWITCH_STATUS_SUCCESS)
+        {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Timer Setup Failed. Cannot Start Write Thread\n");
+            switch_core_codec_destroy(&write_codec);
+            return NULL;
+        }
+
+        while (!tech_pvt->close_requested && switch_core_session_running(session))
+        {
+            if (switch_mutex_trylock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS)
+            {
+                switch_size_t available = switch_buffer_inuse(tech_pvt->write_sbuffer);
+                if (available >= bytes)
+                {
+                    write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
+                    write_frame.samples = write_frame.datalen / 2 / channels;
+                    switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                }
+                switch_mutex_unlock(tech_pvt->write_mutex);
+            }
+            switch_core_timer_next(&timer);
+        }
+
+        switch_core_timer_destroy(&timer);
+        switch_core_codec_destroy(&write_codec);
+        return NULL;
+    }
+
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
-                                     uint32_t sampling, int desiredSampling, int channels, char *metadata, responseHandler_t responseHandler,
+                                     uint32_t sampling, int wsSampling, int channels, char *metadata, responseHandler_t responseHandler,
                                      int deflate, int heart_beat, bool suppressLog, int rtp_packets, const char* extra_headers,
-                                     const char *tls_cafile, const char *tls_keyfile, const char *tls_certfile, 
+                                     const char *tls_cafile, const char *tls_keyfile, const char *tls_certfile,
                                      bool tls_disable_hostname_validation)
     {
         int err; //speex
@@ -456,7 +617,8 @@ namespace {
 
         strncpy(tech_pvt->sessionId, switch_core_session_get_uuid(session), MAX_SESSION_ID);
         strncpy(tech_pvt->ws_uri, wsUri, MAX_WS_URI);
-        tech_pvt->sampling = desiredSampling;
+        tech_pvt->sampling = sampling;
+        tech_pvt->wsSampling = wsSampling;
         tech_pvt->responseHandler = responseHandler;
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
@@ -464,9 +626,10 @@ namespace {
 
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
-        //size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
-        const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
-        
+        //size_t buflen = (FRAME_SIZE_8000 * wsSampling / 8000 * channels * 1000 / RTP_PERIOD * BUFFERED_SEC);
+        const size_t buflen = (FRAME_SIZE_8000 * wsSampling / 8000 * channels * rtp_packets);
+
+        // Upstream: use shared_ptr factory for safe weak_ptr callbacks
         auto sp = AudioStreamer::create(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat,
                                         suppressLog, extra_headers, tls_cafile, tls_keyfile,
                                         tls_certfile, tls_disable_hostname_validation);
@@ -474,18 +637,30 @@ namespace {
         tech_pvt->pAudioStreamer = new std::shared_ptr<AudioStreamer>(sp);
 
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
-        
-        if (switch_buffer_create(pool, &tech_pvt->sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
+        switch_mutex_init(&tech_pvt->write_mutex, SWITCH_MUTEX_NESTED, pool);
+
+        if (switch_buffer_create(pool, &tech_pvt->read_sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                "%s: Error creating switch buffer.\n", tech_pvt->sessionId);
+                "%s: Error creating read switch buffer.\n", tech_pvt->sessionId);
             return SWITCH_STATUS_FALSE;
         }
 
-        if (desiredSampling != sampling) {
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) resampling from %u to %u\n", tech_pvt->sessionId, sampling, desiredSampling);
-            tech_pvt->resampler = speex_resampler_init(channels, sampling, desiredSampling, SWITCH_RESAMPLE_QUALITY, &err);
+        if (switch_buffer_create(pool, &tech_pvt->write_sbuffer, buflen) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "%s: Error creating write switch buffer.\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        if (wsSampling != (int)sampling) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) resampling from %u to %d\n", tech_pvt->sessionId, sampling, wsSampling);
+            tech_pvt->read_resampler = speex_resampler_init(channels, sampling, wsSampling, SWITCH_RESAMPLE_QUALITY, &err);
             if (0 != err) {
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing resampler: %s.\n", speex_resampler_strerror(err));
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing read resampler: %s.\n", speex_resampler_strerror(err));
+                return SWITCH_STATUS_FALSE;
+            }
+            tech_pvt->write_resampler = speex_resampler_init(channels, wsSampling, sampling, SWITCH_RESAMPLE_QUALITY, &err);
+            if (0 != err) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing write resampler: %s.\n", speex_resampler_strerror(err));
                 return SWITCH_STATUS_FALSE;
             }
         }
@@ -500,13 +675,21 @@ namespace {
 
     void destroy_tech_pvt(private_t* tech_pvt) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s destroy_tech_pvt\n", tech_pvt->sessionId);
-        if (tech_pvt->resampler) {
-            speex_resampler_destroy(tech_pvt->resampler);
-            tech_pvt->resampler = nullptr;
+        if (tech_pvt->read_resampler) {
+            speex_resampler_destroy(tech_pvt->read_resampler);
+            tech_pvt->read_resampler = nullptr;
+        }
+        if (tech_pvt->write_resampler) {
+            speex_resampler_destroy(tech_pvt->write_resampler);
+            tech_pvt->write_resampler = nullptr;
         }
         if (tech_pvt->mutex) {
             switch_mutex_destroy(tech_pvt->mutex);
             tech_pvt->mutex = nullptr;
+        }
+        if (tech_pvt->write_mutex) {
+            switch_mutex_destroy(tech_pvt->write_mutex);
+            tech_pvt->write_mutex = nullptr;
         }
     }
 
@@ -603,6 +786,7 @@ extern "C" {
 
         if (!tech_pvt) return SWITCH_STATUS_FALSE;
 
+        // Upstream: use shared_ptr copy pattern for thread safety
         std::shared_ptr<AudioStreamer> streamer;
 
         switch_mutex_lock(tech_pvt->mutex);
@@ -644,7 +828,7 @@ extern "C" {
                                         responseHandler_t responseHandler,
                                         uint32_t samples_per_second,
                                         char *wsUri,
-                                        int sampling,
+                                        int wsSampling,
                                         int channels,
                                         char* metadata,
                                         void **ppUserData)
@@ -705,8 +889,8 @@ extern "C" {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error allocating memory!\n");
             return SWITCH_STATUS_FALSE;
         }
-        if (SWITCH_STATUS_SUCCESS != stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, channels, 
-                                                        metadata, responseHandler, deflate, heart_beat, suppressLog, rtp_packets, 
+        if (SWITCH_STATUS_SUCCESS != stream_data_init(tech_pvt, session, wsUri, samples_per_second, wsSampling, channels,
+                                                        metadata, responseHandler, deflate, heart_beat, suppressLog, rtp_packets,
                                                         extra_headers, tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation)) {
             destroy_tech_pvt(tech_pvt);
             return SWITCH_STATUS_FALSE;
@@ -717,11 +901,24 @@ extern "C" {
         return SWITCH_STATUS_SUCCESS;
     }
 
+    // Voxcom: initialize the write frame thread for bidirectional streaming
+    switch_status_t stream_session_write_thread_init(switch_core_session_t *session, void *pUserData)
+    {
+        private_t *tech_pvt = (private_t *)pUserData;
+        switch_threadattr_t *thd_attr = NULL;
+        switch_threadattr_create(&thd_attr, switch_core_session_get_pool(session));
+        switch_threadattr_detach_set(thd_attr, 0);
+        switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+        switch_thread_create(&tech_pvt->write_thread, thd_attr, write_frame_thread, session, switch_core_session_get_pool(session));
+        return SWITCH_STATUS_SUCCESS;
+    }
+
     switch_bool_t stream_frame(switch_media_bug_t *bug) {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
         if (!tech_pvt) return SWITCH_TRUE;
         if (tech_pvt->audio_paused || tech_pvt->cleanup_started) return SWITCH_TRUE;
-        
+
+        // Upstream: copy shared_ptr + batch sends outside mutex
         std::shared_ptr<AudioStreamer> streamer;
         std::vector<std::vector<uint8_t>> pending_send;
 
@@ -742,12 +939,12 @@ extern "C" {
 
         streamer = *sp_ptr;
 
-        auto *resampler = tech_pvt->resampler;
+        auto *resampler = tech_pvt->read_resampler;
         const int channels = tech_pvt->channels;
         const int rtp_packets = tech_pvt->rtp_packets;
 
         if (nullptr == resampler) {
-            
+
             uint8_t data_buf[SWITCH_RECOMMENDED_BUFFER_SIZE];
             switch_frame_t frame = {};
             frame.data = data_buf;
@@ -763,23 +960,23 @@ extern "C" {
                     continue;
                 }
 
-                size_t freespace = switch_buffer_freespace(tech_pvt->sbuffer);
-                
+                size_t freespace = switch_buffer_freespace(tech_pvt->read_sbuffer);
+
                 if (freespace >= frame.datalen) {
-                    switch_buffer_write(tech_pvt->sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
+                    switch_buffer_write(tech_pvt->read_sbuffer, static_cast<uint8_t *>(frame.data), frame.datalen);
                 }
 
-                if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
+                if (switch_buffer_freespace(tech_pvt->read_sbuffer) == 0) {
+                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
                     if (inuse > 0) {
                         std::vector<uint8_t> tmp(inuse);
-                        switch_buffer_read(tech_pvt->sbuffer, tmp.data(), inuse);
-                        switch_buffer_zero(tech_pvt->sbuffer);
+                        switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
+                        switch_buffer_zero(tech_pvt->read_sbuffer);
                         pending_send.emplace_back(std::move(tmp));
                     }
                 }
             }
-            
+
         } else {
 
             uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
@@ -792,17 +989,17 @@ extern "C" {
                     continue;
                 }
 
-                const size_t freespace = switch_buffer_freespace(tech_pvt->sbuffer);
+                const size_t freespace = switch_buffer_freespace(tech_pvt->read_sbuffer);
                 spx_uint32_t in_len = frame.samples;
                 spx_uint32_t out_len = (freespace / (tech_pvt->channels * sizeof(spx_int16_t)));
-                
+
                 if(out_len == 0) {
                     if(freespace == 0) {
-                        switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
+                        switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
                         if (inuse > 0) {
                             std::vector<uint8_t> tmp(inuse);
-                            switch_buffer_read(tech_pvt->sbuffer, tmp.data(), inuse);
-                            switch_buffer_zero(tech_pvt->sbuffer);
+                            switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
+                            switch_buffer_zero(tech_pvt->read_sbuffer);
                             pending_send.emplace_back(std::move(tmp));
                         }
                     }
@@ -836,25 +1033,25 @@ extern "C" {
                         continue;
                     }
 
-                    if (bytes_written <= switch_buffer_freespace(tech_pvt->sbuffer)) {
-                        switch_buffer_write(tech_pvt->sbuffer, (const uint8_t *)out.data(), bytes_written);
+                    if (bytes_written <= switch_buffer_freespace(tech_pvt->read_sbuffer)) {
+                        switch_buffer_write(tech_pvt->read_sbuffer, (const uint8_t *)out.data(), bytes_written);
                     }
                 }
 
-                if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
+                if (switch_buffer_freespace(tech_pvt->read_sbuffer) == 0) {
+                    switch_size_t inuse = switch_buffer_inuse(tech_pvt->read_sbuffer);
                     if (inuse > 0) {
                         std::vector<uint8_t> tmp(inuse);
-                        switch_buffer_read(tech_pvt->sbuffer, tmp.data(), inuse);
-                        switch_buffer_zero(tech_pvt->sbuffer);
+                        switch_buffer_read(tech_pvt->read_sbuffer, tmp.data(), inuse);
+                        switch_buffer_zero(tech_pvt->read_sbuffer);
                         pending_send.emplace_back(std::move(tmp));
                     }
                 }
             }
         }
-        
+
         switch_mutex_unlock(tech_pvt->mutex);
-    
+
         if (!streamer || !streamer->isConnected()) return SWITCH_TRUE;
 
         for (auto &chunk : pending_send) {
@@ -885,10 +1082,15 @@ extern "C" {
                 return SWITCH_STATUS_SUCCESS;
             }
             tech_pvt->cleanup_started = 1;
+            tech_pvt->close_requested = 1;
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
 
             switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+
+            // Save write_thread handle before clearing
+            switch_thread_t *write_thread = tech_pvt->write_thread;
+            tech_pvt->write_thread = nullptr;
 
             sp_wrap = static_cast<std::shared_ptr<AudioStreamer>*>(tech_pvt->pAudioStreamer);
             tech_pvt->pAudioStreamer = nullptr;
@@ -911,9 +1113,18 @@ extern "C" {
             if(streamer) {
                 streamer->deleteFiles();
                 if (text) streamer->writeText(text);
-                
+
                 streamer->markCleanedUp();
                 streamer->disconnect();
+            }
+
+            // Voxcom: join write_frame_thread before destroying resources
+            if (write_thread) {
+                switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
+                switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
+                if (join_result != SWITCH_STATUS_SUCCESS) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "(%s) stream_session_cleanup: failed to join write thread (%d)\n", sessionId, join_result);
+                }
             }
 
             destroy_tech_pvt(tech_pvt);
