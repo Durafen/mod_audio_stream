@@ -77,6 +77,7 @@ public:
         }
     }
 
+    // acabcaf: clear ALL callbacks to prevent dangling calls during cleanup
     void markCleanedUp() {
         m_cleanedUp.store(true, std::memory_order_release);
         client.setMessageCallback({});
@@ -259,6 +260,9 @@ private:
     void eventCallback(notifyEvent_t event, const char* message) {
         std::string msg = message ? message : "";
 
+        // acabcaf: check if cleanup has started before accessing any session data
+        if (isCleanedUp()) return;
+
         // processing without holding a session (for file-based audio types)
         ProcessResult pr;
         if (event == MESSAGE) {
@@ -357,6 +361,10 @@ private:
         }
 
         const size_t bytes_out = out_len * channels * sizeof(spx_int16_t);
+
+        // acabcaf: check again before locking to prevent race condition during cleanup
+        if (tech_pvt->close_requested) return;
+
         if (switch_mutex_lock(tech_pvt->write_mutex) == SWITCH_STATUS_SUCCESS) {
             size_t remaining = bytes_out;
             const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
@@ -1114,7 +1122,9 @@ extern "C" {
                 streamer->deleteFiles();
                 if (text) streamer->writeText(text);
 
+                // acabcaf: mark as cleaned up and clear callbacks FIRST to prevent race conditions
                 streamer->markCleanedUp();
+                // acabcaf: disconnect synchronously to ensure no callbacks fire during cleanup
                 streamer->disconnect();
             }
 
