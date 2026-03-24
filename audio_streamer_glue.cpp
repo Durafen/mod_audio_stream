@@ -372,7 +372,12 @@ private:
                 switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
                 if (free_space == 0) {
                     switch_mutex_unlock(tech_pvt->write_mutex);
+                    // Break out if channel is closing — spinning here blocks the
+                    // libevent event thread and prevents disconnect() from completing,
+                    // which causes zombie channels.
+                    if (tech_pvt->close_requested) return;
                     switch_yield(10000);
+                    if (tech_pvt->close_requested) return;
                     switch_mutex_lock(tech_pvt->write_mutex);
                     continue;
                 }
