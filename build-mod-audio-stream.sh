@@ -16,7 +16,7 @@ if [ -d "$FS_PKGCONFIG" ]; then
     export PKG_CONFIG_PATH=$FS_PKGCONFIG
 fi
 
-mkdir build && cd build
+mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 make install
